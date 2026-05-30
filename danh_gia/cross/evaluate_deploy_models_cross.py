@@ -14,7 +14,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.metrics import precision_recall_fscore_support
 from tqdm.auto import tqdm
 
 
@@ -24,6 +24,7 @@ DEFAULT_MODEL_NAMES = ("resnet18", "resnet50", "convnext_tiny")
 DEFAULT_MODES = ("cnn", "svm")
 DEFAULT_OUTPUT_DIR = "ket_qua"
 DEFAULT_OUTPUT_FILE = "cross_metrics.csv"
+DEFAULT_BATCH_SIZE = 1
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 
 
@@ -60,7 +61,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated model names to evaluate: resnet18,resnet50,convnext_tiny.",
     )
     parser.add_argument("--device", default=None, help="auto, cpu, cuda, cuda:0, ... Default: deploy config runtime.device.")
-    parser.add_argument("--batch-size", type=int, default=None, help="Override deploy config batch size.")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="Batch size used for every model. Use the same value for x and cross timing comparisons.",
+    )
     parser.add_argument(
         "--prediction-map",
         default="auto",
@@ -186,10 +192,6 @@ def apply_prediction_map(predictions: np.ndarray, mapping: dict[int, int]) -> np
     return np.asarray([mapping[int(pred)] for pred in predictions], dtype=np.int64)
 
 
-def format_prediction_map(mapping: dict[int, int]) -> str:
-    return ";".join(f"{key}->{value}" for key, value in sorted(mapping.items()))
-
-
 def normalize_model_name(name: str) -> str:
     normalized = name.lower().replace("-", "_").replace(" ", "_")
     aliases = {
@@ -294,14 +296,6 @@ def predict_batch(
     return np.asarray(svm_model.predict(features), dtype=np.int64)
 
 
-def format_labels(label_names: Sequence[str]) -> str:
-    return ";".join(f"{idx}:{name}" for idx, name in enumerate(label_names))
-
-
-def format_support(y_true: np.ndarray, labels: Sequence[int]) -> str:
-    return ";".join(f"{label}:{int((y_true == label).sum())}" for label in labels)
-
-
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, labels: Sequence[int]) -> dict[str, float]:
     precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
         y_true,
@@ -310,21 +304,10 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, labels: Sequence[int
         average="macro",
         zero_division=0,
     )
-    precision_weighted, recall_weighted, f1_weighted, _ = precision_recall_fscore_support(
-        y_true,
-        y_pred,
-        labels=labels,
-        average="weighted",
-        zero_division=0,
-    )
     return {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
         "precision_macro": float(precision_macro),
         "recall_macro": float(recall_macro),
         "f1_macro": float(f1_macro),
-        "precision_weighted": float(precision_weighted),
-        "recall_weighted": float(recall_weighted),
-        "f1_weighted": float(f1_weighted),
     }
 
 
@@ -341,7 +324,7 @@ def evaluate_cnn_svm(
     names = module.label_names(cfg)
     device_name = args.device or cfg.get("runtime", {}).get("device", "auto")
     device = module.get_device(device_name)
-    batch_size = args.batch_size or int(cfg.get("runtime", {}).get("batch_size", 32))
+    batch_size = args.batch_size if args.batch_size is not None else DEFAULT_BATCH_SIZE
     transform = module.build_transform(cfg)
 
     checkpoint_path = module.resolve_path(cfg["paths"]["cnn_checkpoint"], config_path.parent)
@@ -391,12 +374,8 @@ def evaluate_cnn_svm(
             "mode": mode,
             "status": "ok",
             "num_images": int(len(y_true)),
-            "num_classes": len(labels),
             "device": str(device),
             "batch_size": batch_size,
-            "labels": "0:khong_gach;1:co_gach",
-            "support_by_label": format_support(y_true, labels),
-            "prediction_map": format_prediction_map(mapping),
             "time_total_s": float(inference_time),
             "time_per_image_ms": float((inference_time / max(len(y_true), 1)) * 1000.0),
             "images_per_second": float(len(y_true) / inference_time) if inference_time > 0 else 0.0,
@@ -421,22 +400,14 @@ def ordered_metrics_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
         "mode",
         "status",
         "num_images",
-        "num_classes",
         "device",
         "batch_size",
-        "accuracy",
         "precision_macro",
         "recall_macro",
         "f1_macro",
-        "precision_weighted",
-        "recall_weighted",
-        "f1_weighted",
         "time_total_s",
         "time_per_image_ms",
         "images_per_second",
-        "labels",
-        "support_by_label",
-        "prediction_map",
         "error",
     ]
     frame = pd.DataFrame(rows)
@@ -458,6 +429,9 @@ def resolve_output_dir(raw_path: str) -> Path:
 
 def main() -> None:
     args = parse_args()
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be a positive integer.")
+
     data_dir = resolve_data_path(args.data)
     image_paths, y_true = list_eval_samples(data_dir)
     model_names = parse_model_list(args.models)
@@ -466,6 +440,7 @@ def main() -> None:
     print(f"Images: {len(image_paths)} | class 0={int((y_true == 0).sum())}, class 1={int((y_true == 1).sum())}")
     print("Evaluate labels: 0=khong gach, 1=co gach")
     print("Modes: cnn, svm")
+    print(f"Batch size: {args.batch_size}")
     print("Timing: model inference only; image loading/preprocessing is outside the timer.")
 
     metric_rows: list[dict[str, Any]] = []
@@ -490,7 +465,6 @@ def main() -> None:
         "model",
         "mode",
         "status",
-        "accuracy",
         "precision_macro",
         "recall_macro",
         "f1_macro",

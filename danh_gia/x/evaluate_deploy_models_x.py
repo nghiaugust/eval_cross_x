@@ -14,7 +14,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.metrics import precision_recall_fscore_support
 from tqdm.auto import tqdm
 
 
@@ -25,6 +25,7 @@ DEFAULT_DATA_LABEL_NAMES = ("no_x", "x_mark", "x_cancel")
 DEFAULT_MODES = ("cnn", "svm")
 DEFAULT_OUTPUT_DIR = "ket_qua"
 DEFAULT_OUTPUT_FILE = "x_metrics.csv"
+DEFAULT_BATCH_SIZE = 1
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 
 
@@ -63,7 +64,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-file", default=DEFAULT_OUTPUT_FILE, help="Metrics CSV filename.")
     parser.add_argument("--device", default=None, help="auto, cpu, cuda, cuda:0, ... Default: deploy config runtime.device.")
-    parser.add_argument("--batch-size", type=int, default=None, help="Override deploy config batch size.")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="Batch size used for every model. Use the same value for x and cross timing comparisons.",
+    )
     parser.add_argument(
         "--data-label-names",
         nargs=3,
@@ -245,14 +251,6 @@ def predict_batch(
     return np.asarray(svm_model.predict(features), dtype=np.int64)
 
 
-def format_labels(label_names: Sequence[str]) -> str:
-    return ";".join(f"{idx}:{name}" for idx, name in enumerate(label_names))
-
-
-def format_support(y_true: np.ndarray, labels: Sequence[int]) -> str:
-    return ";".join(f"{label}:{int((y_true == label).sum())}" for label in labels)
-
-
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, labels: Sequence[int]) -> dict[str, float]:
     precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
         y_true,
@@ -261,21 +259,10 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, labels: Sequence[int
         average="macro",
         zero_division=0,
     )
-    precision_weighted, recall_weighted, f1_weighted, _ = precision_recall_fscore_support(
-        y_true,
-        y_pred,
-        labels=labels,
-        average="weighted",
-        zero_division=0,
-    )
     return {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
         "precision_macro": float(precision_macro),
         "recall_macro": float(recall_macro),
         "f1_macro": float(f1_macro),
-        "precision_weighted": float(precision_weighted),
-        "recall_weighted": float(recall_weighted),
-        "f1_weighted": float(f1_weighted),
     }
 
 
@@ -296,7 +283,7 @@ def evaluate_target(
 
     device_name = device_override or cfg.get("runtime", {}).get("device", "auto")
     device = module.get_device(device_name)
-    batch_size = batch_size_override or int(cfg.get("runtime", {}).get("batch_size", 8))
+    batch_size = batch_size_override if batch_size_override is not None else DEFAULT_BATCH_SIZE
 
     checkpoint_path = resolve_deploy_path(module, cfg["paths"]["cnn_checkpoint"], config_dir)
     svm_path = resolve_deploy_path(module, cfg["paths"]["svm_model"], config_dir)
@@ -349,12 +336,8 @@ def evaluate_target(
             "mode": target.mode,
             "status": "ok",
             "num_images": total_images,
-            "num_classes": len(model_label_names),
             "device": str(device),
             "batch_size": batch_size,
-            "labels": format_labels(model_label_names),
-            "support_by_label": format_support(y_true, labels),
-            "prediction_map": "",
             "time_total_s": float(total_inference_time),
             "time_per_image_ms": float((total_inference_time / total_images) * 1000.0),
             "images_per_second": float(total_images / total_inference_time) if total_inference_time > 0 else 0.0,
@@ -387,22 +370,14 @@ def ordered_metrics_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
         "mode",
         "status",
         "num_images",
-        "num_classes",
         "device",
         "batch_size",
-        "accuracy",
         "precision_macro",
         "recall_macro",
         "f1_macro",
-        "precision_weighted",
-        "recall_weighted",
-        "f1_weighted",
         "time_total_s",
         "time_per_image_ms",
         "images_per_second",
-        "labels",
-        "support_by_label",
-        "prediction_map",
         "error",
     ]
     frame = pd.DataFrame(rows)
@@ -424,12 +399,16 @@ def resolve_output_dir(raw_path: str) -> Path:
 
 def main() -> None:
     args = parse_args()
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be a positive integer.")
+
     data_dir = resolve_data_path(args.data)
     output_dir = resolve_output_dir(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Dataset: {data_dir}")
     print("Modes: cnn, svm")
+    print(f"Batch size: {args.batch_size}")
     print("Timing: model inference only; image loading/preprocessing is outside the timer.")
 
     summaries: list[dict[str, Any]] = []
@@ -458,7 +437,6 @@ def main() -> None:
         "model",
         "mode",
         "status",
-        "accuracy",
         "precision_macro",
         "recall_macro",
         "f1_macro",
