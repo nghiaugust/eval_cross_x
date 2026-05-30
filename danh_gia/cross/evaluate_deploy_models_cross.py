@@ -2,57 +2,65 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import inspect
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, Sequence
 
 import joblib
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
-from tqdm import tqdm
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from tqdm.auto import tqdm
 
 
-IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 BASE_DIR = Path(__file__).resolve().parent
+EVAL_ROOT = BASE_DIR.parent
+DEFAULT_MODEL_NAMES = ("resnet18", "resnet50", "convnext_tiny")
+DEFAULT_MODES = ("cnn", "svm")
+DEFAULT_OUTPUT_DIR = "ket_qua"
+DEFAULT_OUTPUT_FILE = "cross_metrics.csv"
+IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 
 
 @dataclass(frozen=True)
 class ModelSpec:
     name: str
     deploy_dir: Path
-    kind: str
 
 
 MODEL_SPECS = {
-    "resnet18": ModelSpec("resnet18", Path("deploy_resnet18"), "cnn_svm"),
-    "resnet50": ModelSpec("resnet50", Path("deploy_resnet50"), "cnn_svm"),
-    "convnext_tiny": ModelSpec("convnext_tiny", Path("deploy_convnext_tiny"), "cnn_svm"),
-    "yolov8": ModelSpec("yolov8", Path("deploy_yolov8"), "yolo"),
+    "resnet18": ModelSpec("resnet18", Path("deploy_resnet18")),
+    "resnet50": ModelSpec("resnet50", Path("deploy_resnet50")),
+    "convnext_tiny": ModelSpec("convnext_tiny", Path("deploy_convnext_tiny")),
 }
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate all deploy models on evaluate/0 and evaluate/1 folders.")
-    parser.add_argument("--data", default="evaluate", help="Folder with class subfolders 0 and 1.")
-    parser.add_argument("--output", default="runs/deploy_evaluation/metrics.csv", help="CSV metrics output.")
-    parser.add_argument("--predictions-output", default=None, help="Optional per-image predictions CSV output.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate ResNet/ConvNeXt deploy models on data/0 and data/1. "
+            "Each selected model is evaluated in both cnn and svm modes."
+        )
+    )
+    parser.add_argument("--data", default="data", help="Dataset folder containing class folders 0 and 1.")
+    parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_OUTPUT_DIR,
+        help="Folder for the single metrics CSV. Relative paths are created under danh_gia/.",
+    )
+    parser.add_argument("--output-file", default=DEFAULT_OUTPUT_FILE, help="Metrics CSV filename.")
     parser.add_argument(
         "--models",
-        default="resnet18,resnet50,convnext_tiny,yolov8",
-        help="Comma-separated model names to evaluate.",
+        default=",".join(DEFAULT_MODEL_NAMES),
+        help="Comma-separated model names to evaluate: resnet18,resnet50,convnext_tiny.",
     )
-    parser.add_argument(
-        "--cnn-mode",
-        choices=["cnn", "svm", "both"],
-        default="both",
-        help="Mode for ResNet/ConvNeXt deploy folders. Default evaluates both cnn and svm.",
-    )
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")
-    parser.add_argument("--batch-size", type=int, default=None, help="Override deploy batch size.")
+    parser.add_argument("--device", default=None, help="auto, cpu, cuda, cuda:0, ... Default: deploy config runtime.device.")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override deploy config batch size.")
     parser.add_argument(
         "--prediction-map",
         default="auto",
@@ -112,6 +120,7 @@ def import_deploy_module(spec: ModelSpec) -> ModuleType:
         raise ImportError(f"Cannot import deploy script: {script_path}")
 
     module = importlib.util.module_from_spec(import_spec)
+    sys.modules[module_name] = module
     import_spec.loader.exec_module(module)
     return module
 
@@ -125,20 +134,17 @@ def parse_model_list(raw: str) -> list[str]:
     return models
 
 
-def is_cuda_device(device: torch.device) -> bool:
-    return device.type == "cuda"
-
-
-def sync_if_needed(device: torch.device) -> None:
-    if is_cuda_device(device):
+def cuda_synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
         torch.cuda.synchronize(device)
 
 
-def timed_call(device: torch.device, fn):
-    sync_if_needed(device)
+def timed_call(device: torch.device, fn) -> tuple[Any, float]:
+    cuda_synchronize(device)
     start = time.perf_counter()
-    result = fn()
-    sync_if_needed(device)
+    with torch.inference_mode():
+        result = fn()
+    cuda_synchronize(device)
     return result, time.perf_counter() - start
 
 
@@ -155,7 +161,7 @@ def eval_label_from_name(name: str) -> int | None:
     return None
 
 
-def build_prediction_map(raw: str, names: list[str]) -> dict[int, int]:
+def build_prediction_map(raw: str, names: Sequence[str]) -> dict[int, int]:
     text = raw.strip().lower()
     if text == "identity":
         return {idx: idx for idx in range(len(names))}
@@ -184,36 +190,220 @@ def format_prediction_map(mapping: dict[int, int]) -> str:
     return ";".join(f"{key}->{value}" for key, value in sorted(mapping.items()))
 
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float | int]:
-    precision, recall, f1, support = precision_recall_fscore_support(
+def normalize_model_name(name: str) -> str:
+    normalized = name.lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "resnet_18": "resnet18",
+        "resnet_50": "resnet50",
+        "convnexttiny": "convnext_tiny",
+        "convnext_t": "convnext_tiny",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def load_cnn_model(
+    module: ModuleType,
+    cfg: dict,
+    checkpoint_path: Path,
+    num_classes: int,
+    device: torch.device,
+) -> tuple[torch.nn.Module, str]:
+    signature = inspect.signature(module.load_cnn)
+    if "cfg" in signature.parameters:
+        loaded = module.load_cnn(checkpoint_path, cfg, num_classes=num_classes, device=device)
+    else:
+        loaded = module.load_cnn(checkpoint_path, num_classes=num_classes, device=device)
+
+    if isinstance(loaded, tuple):
+        model, model_name = loaded
+        return model, normalize_model_name(str(model_name))
+
+    model_name = normalize_model_name(str(cfg.get("model", {}).get("name", "model")))
+    return loaded, model_name
+
+
+def build_feature_extractor(
+    module: ModuleType,
+    cnn_model: torch.nn.Module,
+    model_name: str,
+    device: torch.device,
+) -> torch.nn.Module | None:
+    if hasattr(module, "CNNFeatureExtractor"):
+        extractor = module.CNNFeatureExtractor(cnn_model, model_name)
+    else:
+        extractor_classes = {
+            "resnet18": "ResNet18FeatureExtractor",
+            "resnet50": "ResNet50FeatureExtractor",
+            "convnext_tiny": "ConvNeXtTinyFeatureExtractor",
+        }
+        class_name = extractor_classes.get(model_name)
+        extractor_cls = getattr(module, class_name, None) if class_name else None
+        if extractor_cls is None:
+            return None
+        extractor = extractor_cls(cnn_model)
+
+    extractor.to(device)
+    extractor.eval()
+    return extractor
+
+
+def extract_features_with_extractor(
+    extractor: torch.nn.Module,
+    batch: torch.Tensor,
+    device: torch.device,
+) -> np.ndarray:
+    features = extractor(batch.to(device))
+    if isinstance(features, torch.Tensor):
+        features = features.detach().cpu().numpy()
+    return np.asarray(features, dtype=np.float32)
+
+
+def extract_features_with_module(
+    module: ModuleType,
+    cnn_model: torch.nn.Module,
+    model_name: str,
+    batch: torch.Tensor,
+    device: torch.device,
+) -> np.ndarray:
+    signature = inspect.signature(module.extract_features)
+    if "model_name" in signature.parameters:
+        features = module.extract_features(cnn_model, model_name, batch, device)
+    else:
+        features = module.extract_features(cnn_model, batch, device)
+    return np.asarray(features, dtype=np.float32)
+
+
+def predict_batch(
+    module: ModuleType,
+    mode: str,
+    cnn_model: torch.nn.Module,
+    model_name: str,
+    svm_model,
+    extractor: torch.nn.Module | None,
+    batch: torch.Tensor,
+    device: torch.device,
+) -> np.ndarray:
+    if mode == "cnn":
+        predictions, _ = module.predict_cnn(cnn_model, batch, device)
+        return np.asarray(predictions, dtype=np.int64)
+
+    if extractor is not None:
+        features = extract_features_with_extractor(extractor, batch, device)
+    else:
+        features = extract_features_with_module(module, cnn_model, model_name, batch, device)
+    return np.asarray(svm_model.predict(features), dtype=np.int64)
+
+
+def format_labels(label_names: Sequence[str]) -> str:
+    return ";".join(f"{idx}:{name}" for idx, name in enumerate(label_names))
+
+
+def format_support(y_true: np.ndarray, labels: Sequence[int]) -> str:
+    return ";".join(f"{label}:{int((y_true == label).sum())}" for label in labels)
+
+
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, labels: Sequence[int]) -> dict[str, float]:
+    precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
         y_true,
         y_pred,
-        labels=[0, 1],
-        zero_division=0,
-    )
-    macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
-        y_true,
-        y_pred,
+        labels=labels,
         average="macro",
         zero_division=0,
     )
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    tn, fp, fn, tp = cm.ravel()
+    precision_weighted, recall_weighted, f1_weighted, _ = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        labels=labels,
+        average="weighted",
+        zero_division=0,
+    )
     return {
         "accuracy": float(accuracy_score(y_true, y_pred)),
-        "precision": float(precision[1]),
-        "recall": float(recall[1]),
-        "f1": float(f1[1]),
-        "precision_macro": float(macro_precision),
-        "recall_macro": float(macro_recall),
-        "f1_macro": float(macro_f1),
-        "support_0": int(support[0]),
-        "support_1": int(support[1]),
-        "tn": int(tn),
-        "fp": int(fp),
-        "fn": int(fn),
-        "tp": int(tp),
+        "precision_macro": float(precision_macro),
+        "recall_macro": float(recall_macro),
+        "f1_macro": float(f1_macro),
+        "precision_weighted": float(precision_weighted),
+        "recall_weighted": float(recall_weighted),
+        "f1_weighted": float(f1_weighted),
     }
+
+
+def evaluate_cnn_svm(
+    spec: ModelSpec,
+    mode: str,
+    image_paths: list[Path],
+    y_true: np.ndarray,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    module = import_deploy_module(spec)
+    config_path = BASE_DIR / spec.deploy_dir / "config.yaml"
+    cfg = module.load_config(config_path)
+    names = module.label_names(cfg)
+    device_name = args.device or cfg.get("runtime", {}).get("device", "auto")
+    device = module.get_device(device_name)
+    batch_size = args.batch_size or int(cfg.get("runtime", {}).get("batch_size", 32))
+    transform = module.build_transform(cfg)
+
+    checkpoint_path = module.resolve_path(cfg["paths"]["cnn_checkpoint"], config_path.parent)
+    svm_path = module.resolve_path(cfg["paths"]["svm_model"], config_path.parent)
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"CNN checkpoint not found: {checkpoint_path}")
+    if mode == "svm" and not svm_path.exists():
+        raise FileNotFoundError(f"SVM model not found: {svm_path}")
+
+    print(f"\nLoading {spec.name}_{mode}")
+    print(f"  CNN checkpoint: {checkpoint_path}")
+    if mode == "svm":
+        print(f"  SVM model: {svm_path}")
+
+    cnn_model, model_name = load_cnn_model(module, cfg, checkpoint_path, num_classes=len(names), device=device)
+    svm_model = None
+    extractor = None
+    if mode == "svm":
+        svm_model = joblib.load(svm_path)
+        extractor = build_feature_extractor(module, cnn_model, model_name, device)
+    mapping = build_prediction_map(args.prediction_map, names)
+
+    eval_predictions: list[int] = []
+    inference_time = 0.0
+
+    total_batches = (len(image_paths) + batch_size - 1) // batch_size
+    desc = f"{spec.name}_{mode}"
+    for start in tqdm(range(0, len(image_paths), batch_size), total=total_batches, desc=desc, unit="batch", dynamic_ncols=True):
+        batch_paths = image_paths[start : start + batch_size]
+        batch = module.load_image_batch(batch_paths, transform)
+
+        deploy_predictions, elapsed = timed_call(
+            device,
+            lambda: predict_batch(module, mode, cnn_model, model_name, svm_model, extractor, batch, device),
+        )
+        inference_time += elapsed
+        mapped = apply_prediction_map(deploy_predictions, mapping)
+        eval_predictions.extend(int(pred) for pred in mapped)
+
+    labels = [0, 1]
+    y_pred = np.asarray(eval_predictions, dtype=np.int64)
+    metrics = compute_metrics(y_true, y_pred, labels)
+    metrics.update(
+        {
+            "model": spec.name,
+            "mode": mode,
+            "status": "ok",
+            "num_images": int(len(y_true)),
+            "num_classes": len(labels),
+            "device": str(device),
+            "batch_size": batch_size,
+            "labels": "0:khong_gach;1:co_gach",
+            "support_by_label": format_support(y_true, labels),
+            "prediction_map": format_prediction_map(mapping),
+            "time_total_s": float(inference_time),
+            "time_per_image_ms": float((inference_time / max(len(y_true), 1)) * 1000.0),
+            "images_per_second": float(len(y_true) / inference_time) if inference_time > 0 else 0.0,
+            "error": "",
+        }
+    )
+    return metrics
 
 
 def missing_row(spec: ModelSpec, mode: str, error: Exception) -> dict[str, Any]:
@@ -225,223 +415,27 @@ def missing_row(spec: ModelSpec, mode: str, error: Exception) -> dict[str, Any]:
     }
 
 
-def resolve_cnn_paths(module: ModuleType, cfg: dict, config_dir: Path, mode: str) -> tuple[Path, Path | None]:
-    checkpoint_path = module.resolve_path(cfg["paths"]["cnn_checkpoint"], config_dir)
-    svm_path = None
-    if mode == "svm":
-        svm_path = module.resolve_path(cfg["paths"]["svm_model"], config_dir)
-    return checkpoint_path, svm_path
-
-
-def build_feature_extractor(module: ModuleType, spec: ModelSpec, cnn_model, model_name: str, device: torch.device):
-    if spec.name == "resnet18":
-        extractor = module.ResNet18FeatureExtractor(cnn_model)
-    else:
-        extractor = module.CNNFeatureExtractor(cnn_model, model_name)
-    extractor.to(device)
-    extractor.eval()
-    return extractor
-
-
-@torch.no_grad()
-def extract_features(extractor, batch: torch.Tensor, device: torch.device) -> np.ndarray:
-    features = extractor(batch.to(device))
-    return features.detach().cpu().numpy().astype("float32")
-
-
-def evaluate_cnn_svm(
-    spec: ModelSpec,
-    mode: str,
-    image_paths: list[Path],
-    y_true: np.ndarray,
-    args: argparse.Namespace,
-) -> tuple[dict[str, Any], pd.DataFrame]:
-    module = import_deploy_module(spec)
-    config_path = BASE_DIR / spec.deploy_dir / "config.yaml"
-    cfg = module.load_config(config_path)
-    names = module.label_names(cfg)
-    device = module.get_device(args.device or cfg.get("runtime", {}).get("device", "auto"))
-    batch_size = args.batch_size or int(cfg.get("runtime", {}).get("batch_size", 32))
-    transform = module.build_transform(cfg)
-    checkpoint_path, svm_path = resolve_cnn_paths(module, cfg, config_path.parent, mode)
-
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"CNN checkpoint not found: {checkpoint_path}")
-    if mode == "svm" and svm_path is not None and not svm_path.exists():
-        raise FileNotFoundError(f"SVM model not found: {svm_path}")
-
-    if spec.name == "resnet18":
-        cnn_model = module.load_cnn(checkpoint_path, num_classes=len(names), device=device)
-        model_name = "resnet18"
-    else:
-        cnn_model, model_name = module.load_cnn(checkpoint_path, cfg, num_classes=len(names), device=device)
-
-    svm_model = joblib.load(svm_path) if mode == "svm" and svm_path is not None else None
-    extractor = build_feature_extractor(module, spec, cnn_model, model_name, device) if svm_model is not None else None
-    mapping = build_prediction_map(args.prediction_map, names)
-
-    deploy_predictions: list[int] = []
-    eval_predictions: list[int] = []
-    rows: list[dict[str, Any]] = []
-    inference_time = 0.0
-
-    total_batches = (len(image_paths) + batch_size - 1) // batch_size
-    desc = f"{spec.name}:{mode}"
-    for start in tqdm(range(0, len(image_paths), batch_size), total=total_batches, desc=desc, unit="batch"):
-        batch_paths = image_paths[start : start + batch_size]
-        batch = module.load_image_batch(batch_paths, transform)
-
-        if mode == "cnn":
-            (preds, _probabilities), elapsed = timed_call(device, lambda: module.predict_cnn(cnn_model, batch, device))
-        else:
-            def predict_svm():
-                features = extract_features(extractor, batch, device)
-                return svm_model.predict(features)
-            preds, elapsed = timed_call(device, predict_svm)
-
-        inference_time += elapsed
-        mapped = apply_prediction_map(np.asarray(preds), mapping)
-        deploy_predictions.extend(int(pred) for pred in preds)
-        eval_predictions.extend(int(pred) for pred in mapped)
-        for offset, (path, deploy_pred, eval_pred) in enumerate(zip(batch_paths, preds, mapped)):
-            rows.append(
-                {
-                    "model": spec.name,
-                    "mode": mode,
-                    "path": str(path),
-                    "true_label": int(y_true[start + offset]),
-                    "deploy_pred_label": int(deploy_pred),
-                    "deploy_pred_name": names[int(deploy_pred)],
-                    "pred_label": int(eval_pred),
-                }
-            )
-
-    y_pred = np.asarray(eval_predictions, dtype=np.int64)
-    metrics = compute_metrics(y_true, y_pred)
-    metrics.update(
-        {
-            "model": spec.name,
-            "mode": mode,
-            "status": "ok",
-            "num_images": int(len(y_true)),
-            "time_total_s": float(inference_time),
-            "time_per_image_ms": float((inference_time / max(len(y_true), 1)) * 1000.0),
-            "images_per_second": float(len(y_true) / inference_time) if inference_time > 0 else 0.0,
-            "prediction_map": format_prediction_map(mapping),
-            "error": "",
-        }
-    )
-    return metrics, pd.DataFrame(rows)
-
-
-def evaluate_yolo(
-    spec: ModelSpec,
-    image_paths: list[Path],
-    y_true: np.ndarray,
-    args: argparse.Namespace,
-) -> tuple[dict[str, Any], pd.DataFrame]:
-    module = import_deploy_module(spec)
-    config_path = BASE_DIR / spec.deploy_dir / "config.yaml"
-    cfg = module.load_config(config_path)
-    checkpoint_path = module.resolve_path(cfg["paths"]["checkpoint"], config_path.parent)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"YOLOv8 checkpoint not found: {checkpoint_path}")
-
-    device = module.get_device(args.device or cfg.get("runtime", {}).get("device", "auto"))
-    batch_size = args.batch_size or int(cfg.get("runtime", {}).get("batch_size", 32))
-    yolo = module.YOLO(str(checkpoint_path))
-    names = module.model_label_names(yolo, cfg)
-    model = yolo.model.to(device)
-    model.eval()
-    transform = module.build_transform(cfg)
-    mapping = build_prediction_map(args.prediction_map, names)
-
-    eval_predictions: list[int] = []
-    rows: list[dict[str, Any]] = []
-    inference_time = 0.0
-
-    total_batches = (len(image_paths) + batch_size - 1) // batch_size
-    for start in tqdm(range(0, len(image_paths), batch_size), total=total_batches, desc=spec.name, unit="batch"):
-        batch_paths = image_paths[start : start + batch_size]
-        batch = module.load_image_batch(batch_paths, transform)
-        probabilities, elapsed = timed_call(device, lambda: module.predict_batch(model, batch, device))
-        inference_time += elapsed
-
-        deploy_preds = probabilities.argmax(axis=1)
-        mapped = apply_prediction_map(np.asarray(deploy_preds), mapping)
-        eval_predictions.extend(int(pred) for pred in mapped)
-        for offset, (path, deploy_pred, eval_pred) in enumerate(zip(batch_paths, deploy_preds, mapped)):
-            rows.append(
-                {
-                    "model": spec.name,
-                    "mode": "classify",
-                    "path": str(path),
-                    "true_label": int(y_true[start + offset]),
-                    "deploy_pred_label": int(deploy_pred),
-                    "deploy_pred_name": names[int(deploy_pred)],
-                    "pred_label": int(eval_pred),
-                }
-            )
-
-    y_pred = np.asarray(eval_predictions, dtype=np.int64)
-    metrics = compute_metrics(y_true, y_pred)
-    metrics.update(
-        {
-            "model": spec.name,
-            "mode": "classify",
-            "status": "ok",
-            "num_images": int(len(y_true)),
-            "time_total_s": float(inference_time),
-            "time_per_image_ms": float((inference_time / max(len(y_true), 1)) * 1000.0),
-            "images_per_second": float(len(y_true) / inference_time) if inference_time > 0 else 0.0,
-            "prediction_map": format_prediction_map(mapping),
-            "error": "",
-        }
-    )
-    return metrics, pd.DataFrame(rows)
-
-
-def evaluate_model(
-    spec: ModelSpec,
-    image_paths: list[Path],
-    y_true: np.ndarray,
-    args: argparse.Namespace,
-) -> tuple[dict[str, Any], pd.DataFrame]:
-    if spec.kind == "yolo":
-        return evaluate_yolo(spec, image_paths, y_true, args)
-    if args.cnn_mode == "both":
-        raise ValueError("evaluate_model does not handle --cnn-mode both for CNN/SVM models.")
-    return evaluate_cnn_svm(spec, args.cnn_mode, image_paths, y_true, args)
-
-
-def cnn_modes(args: argparse.Namespace) -> list[str]:
-    if args.cnn_mode == "both":
-        return ["cnn", "svm"]
-    return [args.cnn_mode]
-
-
 def ordered_metrics_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
     columns = [
         "model",
         "mode",
         "status",
         "num_images",
-        "precision",
-        "recall",
-        "f1",
+        "num_classes",
+        "device",
+        "batch_size",
         "accuracy",
         "precision_macro",
         "recall_macro",
         "f1_macro",
+        "precision_weighted",
+        "recall_weighted",
+        "f1_weighted",
         "time_total_s",
         "time_per_image_ms",
         "images_per_second",
-        "tp",
-        "fp",
-        "tn",
-        "fn",
-        "support_0",
-        "support_1",
+        "labels",
+        "support_by_label",
         "prediction_map",
         "error",
     ]
@@ -452,75 +446,62 @@ def ordered_metrics_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
     return frame[columns]
 
 
+def resolve_data_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    return path.resolve() if path.is_absolute() else (BASE_DIR / path).resolve()
+
+
+def resolve_output_dir(raw_path: str) -> Path:
+    path = Path(raw_path)
+    return path.resolve() if path.is_absolute() else (EVAL_ROOT / path).resolve()
+
+
 def main() -> None:
     args = parse_args()
-    data_dir = Path(args.data)
-    if not data_dir.is_absolute():
-        data_dir = BASE_DIR / data_dir
+    data_dir = resolve_data_path(args.data)
     image_paths, y_true = list_eval_samples(data_dir)
     model_names = parse_model_list(args.models)
 
-    print(f"Dataset: {data_dir.resolve()}")
+    print(f"Dataset: {data_dir}")
     print(f"Images: {len(image_paths)} | class 0={int((y_true == 0).sum())}, class 1={int((y_true == 1).sum())}")
     print("Evaluate labels: 0=khong gach, 1=co gach")
+    print("Modes: cnn, svm")
+    print("Timing: model inference only; image loading/preprocessing is outside the timer.")
 
     metric_rows: list[dict[str, Any]] = []
-    prediction_frames: list[pd.DataFrame] = []
-
     for model_name in model_names:
         spec = MODEL_SPECS[model_name]
-        if spec.kind == "yolo":
+        for mode in DEFAULT_MODES:
             try:
-                metrics, predictions = evaluate_yolo(spec, image_paths, y_true, args)
-                metric_rows.append(metrics)
-                prediction_frames.append(predictions)
+                metric_rows.append(evaluate_cnn_svm(spec, mode, image_paths, y_true, args))
             except Exception as exc:
                 if args.fail_fast:
                     raise
-                print(f"[WARN] {spec.name}:classify skipped: {exc}")
-                metric_rows.append(missing_row(spec, "classify", exc))
-            continue
-
-        for mode in cnn_modes(args):
-            try:
-                metrics, predictions = evaluate_cnn_svm(spec, mode, image_paths, y_true, args)
-                metric_rows.append(metrics)
-                prediction_frames.append(predictions)
-            except Exception as exc:
-                if args.fail_fast:
-                    raise
-                print(f"[WARN] {spec.name}:{mode} skipped: {exc}")
+                print(f"[WARN] {spec.name}_{mode} skipped: {exc}")
                 metric_rows.append(missing_row(spec, mode, exc))
 
     metrics_frame = ordered_metrics_frame(metric_rows)
-    output_path = Path(args.output)
-    if not output_path.is_absolute():
-        output_path = BASE_DIR / output_path
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_dir = resolve_output_dir(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / args.output_file
     metrics_frame.to_csv(output_path, index=False)
-
-    if args.predictions_output and prediction_frames:
-        predictions_path = Path(args.predictions_output)
-        if not predictions_path.is_absolute():
-            predictions_path = BASE_DIR / predictions_path
-        predictions_path.parent.mkdir(parents=True, exist_ok=True)
-        pd.concat(prediction_frames, ignore_index=True).to_csv(predictions_path, index=False)
-        print(f"Saved predictions to: {predictions_path}")
 
     display_columns = [
         "model",
         "mode",
         "status",
-        "precision",
-        "recall",
-        "f1",
+        "accuracy",
+        "precision_macro",
+        "recall_macro",
+        "f1_macro",
         "time_total_s",
         "time_per_image_ms",
         "images_per_second",
         "error",
     ]
+    print("\nSummary")
     print(metrics_frame[display_columns].to_string(index=False))
-    print(f"Saved metrics to: {output_path}")
+    print(f"\nSaved metrics to: {output_path}")
 
 
 if __name__ == "__main__":
