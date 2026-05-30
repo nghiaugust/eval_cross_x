@@ -1,0 +1,24 @@
+model:
+  name: convnext_tiny
+  num_classes: 3
+
+labels:
+  "0": no_x
+  "1": x_cancel
+  "2": x_mark
+
+preprocess:
+  input_size: [640, 640]
+  pad_color: 255
+
+paths:
+  # Put trained CNN checkpoint here, or override with --cnn-checkpoint.
+  cnn_checkpoint: weights/best_cnn.pt
+
+  # Put trained SVM model here, or override with --svm-model.
+  svm_model: weights/svm_model.joblib
+
+runtime:
+  device: auto
+  batch_size: 4
+

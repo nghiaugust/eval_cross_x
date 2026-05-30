@@ -1,0 +1,7 @@
+# Model weights
+*.pt
+*.joblib
+*.pyc
+
+# Numeric data folders
+**/data/[0-9]*/

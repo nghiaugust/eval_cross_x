@@ -1,0 +1,22 @@
+model:
+  name: convnext_tiny
+  num_classes: 2
+
+labels:
+  "0": Gach_Ten
+  "1": Ten
+
+preprocess:
+  input_size: [128, 512]
+  pad_color: 255
+
+paths:
+  # Put trained CNN checkpoint here, or override with --cnn-checkpoint.
+  cnn_checkpoint: weights/best_cnn.pt
+
+  # Put trained SVM model here, or override with --svm-model.
+  svm_model: weights/svm_model.joblib
+
+runtime:
+  device: auto
+  batch_size: 32
