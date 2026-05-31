@@ -297,17 +297,17 @@ def predict_batch(
 
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, labels: Sequence[int]) -> dict[str, float]:
-    precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
+    precision_micro, recall_micro, f1_micro, _ = precision_recall_fscore_support(
         y_true,
         y_pred,
         labels=labels,
-        average="macro",
+        average="micro",
         zero_division=0,
     )
     return {
-        "precision_macro": float(precision_macro),
-        "recall_macro": float(recall_macro),
-        "f1_macro": float(f1_macro),
+        "precision_micro": float(precision_micro),
+        "recall_micro": float(recall_micro),
+        "f1_micro": float(f1_micro),
     }
 
 
@@ -402,9 +402,9 @@ def ordered_metrics_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
         "num_images",
         "device",
         "batch_size",
-        "precision_macro",
-        "recall_macro",
-        "f1_macro",
+        "precision_micro",
+        "recall_micro",
+        "f1_micro",
         "time_total_s",
         "time_per_image_ms",
         "images_per_second",
@@ -465,9 +465,9 @@ def main() -> None:
         "model",
         "mode",
         "status",
-        "precision_macro",
-        "recall_macro",
-        "f1_macro",
+        "precision_micro",
+        "recall_micro",
+        "f1_micro",
         "time_total_s",
         "time_per_image_ms",
         "images_per_second",
