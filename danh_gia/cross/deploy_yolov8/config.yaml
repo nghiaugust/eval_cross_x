@@ -15,6 +15,10 @@ paths:
   # Put trained YOLOv8 classification checkpoint here, or override with --checkpoint.
   checkpoint: weights/best.pt
 
+  # Optional folders added to sys.path before loading checkpoint.
+  # Use this only if the checkpoint was saved with local modules such as src.data.
+  python_paths: []
+
 runtime:
   device: auto
   batch_size: 32
