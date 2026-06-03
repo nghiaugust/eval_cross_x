@@ -20,8 +20,9 @@ from tqdm.auto import tqdm
 
 BASE_DIR = Path(__file__).resolve().parent
 EVAL_ROOT = BASE_DIR.parent
-DEFAULT_MODEL_NAMES = ("resnet18", "resnet50", "convnext_tiny")
-DEFAULT_MODES = ("cnn", "svm")
+DEFAULT_MODEL_NAMES = ("resnet18", "resnet50", "convnext_tiny", "yolov8")
+DEFAULT_CNN_SVM_MODES = ("cnn", "svm")
+DEFAULT_YOLO_MODES = ("yolo",)
 DEFAULT_OUTPUT_DIR = "ket_qua"
 DEFAULT_OUTPUT_FILE = "cross_metrics.csv"
 DEFAULT_BATCH_SIZE = 1
@@ -32,20 +33,28 @@ IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 class ModelSpec:
     name: str
     deploy_dir: Path
+    modes: tuple[str, ...]
 
 
 MODEL_SPECS = {
-    "resnet18": ModelSpec("resnet18", Path("deploy_resnet18")),
-    "resnet50": ModelSpec("resnet50", Path("deploy_resnet50")),
-    "convnext_tiny": ModelSpec("convnext_tiny", Path("deploy_convnext_tiny")),
+    "resnet18": ModelSpec("resnet18", Path("deploy_resnet18"), DEFAULT_CNN_SVM_MODES),
+    "resnet50": ModelSpec("resnet50", Path("deploy_resnet50"), DEFAULT_CNN_SVM_MODES),
+    "convnext_tiny": ModelSpec("convnext_tiny", Path("deploy_convnext_tiny"), DEFAULT_CNN_SVM_MODES),
+    "yolov8": ModelSpec("yolov8", Path("deploy_yolov8"), DEFAULT_YOLO_MODES),
+}
+MODEL_ALIASES = {
+    "yolo": "yolov8",
+    "yolo8": "yolov8",
+    "yolov8_cls": "yolov8",
+    "yolov8_classify": "yolov8",
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate ResNet/ConvNeXt deploy models on data/0 and data/1. "
-            "Each selected model is evaluated in both cnn and svm modes."
+            "Evaluate ResNet/ConvNeXt/YOLOv8 deploy models on data/0 and data/1. "
+            "ResNet/ConvNeXt models are evaluated in cnn and svm modes; YOLOv8 is evaluated in yolo mode."
         )
     )
     parser.add_argument("--data", default="data", help="Dataset folder containing class folders 0 and 1.")
@@ -58,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models",
         default=",".join(DEFAULT_MODEL_NAMES),
-        help="Comma-separated model names to evaluate: resnet18,resnet50,convnext_tiny.",
+        help="Comma-separated model names to evaluate: resnet18,resnet50,convnext_tiny,yolov8. Alias: yolo.",
     )
     parser.add_argument("--device", default=None, help="auto, cpu, cuda, cuda:0, ... Default: deploy config runtime.device.")
     parser.add_argument(
@@ -75,6 +84,7 @@ def parse_args() -> argparse.Namespace:
             "or comma mapping like 1,0 where index=deploy label and value=evaluate label."
         ),
     )
+    parser.add_argument("--yolo-checkpoint", default=None, help="Override YOLOv8 .pt checkpoint path.")
     parser.add_argument("--fail-fast", action="store_true", help="Stop on the first model error.")
     return parser.parse_args()
 
@@ -131,8 +141,13 @@ def import_deploy_module(spec: ModelSpec) -> ModuleType:
     return module
 
 
+def normalize_cli_model_name(name: str) -> str:
+    normalized = name.lower().replace("-", "_").replace(" ", "_")
+    return MODEL_ALIASES.get(normalized, normalized)
+
+
 def parse_model_list(raw: str) -> list[str]:
-    models = [part.strip() for part in raw.split(",") if part.strip()]
+    models = [normalize_cli_model_name(part.strip()) for part in raw.split(",") if part.strip()]
     unknown = [name for name in models if name not in MODEL_SPECS]
     if unknown:
         supported = ", ".join(MODEL_SPECS)
@@ -385,6 +400,69 @@ def evaluate_cnn_svm(
     return metrics
 
 
+def evaluate_yolo(
+    spec: ModelSpec,
+    image_paths: list[Path],
+    y_true: np.ndarray,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    module = import_deploy_module(spec)
+    config_path = BASE_DIR / spec.deploy_dir / "config.yaml"
+    cfg = module.load_config(config_path)
+    device_name = args.device or cfg.get("runtime", {}).get("device", "auto")
+    device = module.get_device(device_name)
+    batch_size = args.batch_size if args.batch_size is not None else DEFAULT_BATCH_SIZE
+    transform = module.build_transform(cfg)
+
+    checkpoint_raw = args.yolo_checkpoint or cfg["paths"]["checkpoint"]
+    checkpoint_path = module.resolve_path(checkpoint_raw, config_path.parent)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"YOLOv8 checkpoint not found: {checkpoint_path}")
+
+    print(f"\nLoading {spec.name}_yolo")
+    print(f"  YOLOv8 checkpoint: {checkpoint_path}")
+
+    yolo_model = module.YOLO(str(checkpoint_path))
+    names = module.config_label_names(cfg)
+    model = yolo_model.model.to(device)
+    model.eval()
+    mapping = build_prediction_map(args.prediction_map, names)
+
+    eval_predictions: list[int] = []
+    inference_time = 0.0
+
+    total_batches = (len(image_paths) + batch_size - 1) // batch_size
+    desc = f"{spec.name}_yolo"
+    for start in tqdm(range(0, len(image_paths), batch_size), total=total_batches, desc=desc, unit="batch", dynamic_ncols=True):
+        batch_paths = image_paths[start : start + batch_size]
+        batch = module.load_image_batch(batch_paths, transform)
+
+        probabilities, elapsed = timed_call(device, lambda: module.predict_batch(model, batch, device))
+        inference_time += elapsed
+        deploy_predictions = np.asarray(probabilities.argmax(axis=1), dtype=np.int64)
+        mapped = apply_prediction_map(deploy_predictions, mapping)
+        eval_predictions.extend(int(pred) for pred in mapped)
+
+    labels = [0, 1]
+    y_pred = np.asarray(eval_predictions, dtype=np.int64)
+    metrics = compute_metrics(y_true, y_pred, labels)
+    metrics.update(
+        {
+            "model": spec.name,
+            "mode": "yolo",
+            "status": "ok",
+            "num_images": int(len(y_true)),
+            "device": str(device),
+            "batch_size": batch_size,
+            "time_total_s": float(inference_time),
+            "time_per_image_ms": float((inference_time / max(len(y_true), 1)) * 1000.0),
+            "images_per_second": float(len(y_true) / inference_time) if inference_time > 0 else 0.0,
+            "error": "",
+        }
+    )
+    return metrics
+
+
 def missing_row(spec: ModelSpec, mode: str, error: Exception) -> dict[str, Any]:
     return {
         "model": spec.name,
@@ -439,16 +517,20 @@ def main() -> None:
     print(f"Dataset: {data_dir}")
     print(f"Images: {len(image_paths)} | class 0={int((y_true == 0).sum())}, class 1={int((y_true == 1).sum())}")
     print("Evaluate labels: 0=khong gach, 1=co gach")
-    print("Modes: cnn, svm")
+    selected_modes = sorted({mode for model_name in model_names for mode in MODEL_SPECS[model_name].modes})
+    print(f"Modes: {', '.join(selected_modes)}")
     print(f"Batch size: {args.batch_size}")
     print("Timing: model inference only; image loading/preprocessing is outside the timer.")
 
     metric_rows: list[dict[str, Any]] = []
     for model_name in model_names:
         spec = MODEL_SPECS[model_name]
-        for mode in DEFAULT_MODES:
+        for mode in spec.modes:
             try:
-                metric_rows.append(evaluate_cnn_svm(spec, mode, image_paths, y_true, args))
+                if mode == "yolo":
+                    metric_rows.append(evaluate_yolo(spec, image_paths, y_true, args))
+                else:
+                    metric_rows.append(evaluate_cnn_svm(spec, mode, image_paths, y_true, args))
             except Exception as exc:
                 if args.fail_fast:
                     raise
