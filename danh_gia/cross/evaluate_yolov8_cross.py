@@ -270,7 +270,7 @@ def evaluate_yolo(args: argparse.Namespace) -> tuple[dict[str, Any], pd.DataFram
         raise FileNotFoundError(f"YOLOv8 checkpoint not found: {checkpoint_path}")
 
     device_name = args.device or cfg.get("runtime", {}).get("device", "auto")
-    batch_size = args.batch_size or int(cfg.get("runtime", {}).get("batch_size", 32))
+    batch_size = args.batch_size or int(cfg.get("runtime", {}).get("batch_size", 1))
     if batch_size <= 0:
         raise ValueError("--batch-size must be a positive integer.")
 

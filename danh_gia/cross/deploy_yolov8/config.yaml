@@ -21,4 +21,4 @@ paths:
 
 runtime:
   device: auto
-  batch_size: 32
+  batch_size: 1

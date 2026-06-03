@@ -1,0 +1,2 @@
+model,mode,status,num_images,device,batch_size,precision_micro,recall_micro,f1_micro,precision_macro,recall_macro,f1_macro,time_total_s,time_per_image_ms,images_per_second,tn,fp,fn,tp,prediction_map,checkpoint,error
+yolov8,yolo,ok,1532,cpu,1,0.9171018276762402,0.9171018276762402,0.9171018276762402,0.9119037123471196,0.9205424714785948,0.9151389061535677,10.75610460457392,7.02095600820752,142.4307457319198,586,38,89,819,0->1;1->0,D:\nghia_ct6\data_thuc_nghiem\eval_cross_x\danh_gia\cross\deploy_yolov8\weights\best.pt,
